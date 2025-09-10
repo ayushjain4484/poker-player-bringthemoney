@@ -45,5 +45,6 @@ class GameStateFetcher:
             rec = {"timestamp": time.time(), "source_url": url, "etag": self.etag, "state": data}
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+                print(f"Saved game state to {path}")
 
         return data
