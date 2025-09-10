@@ -5,10 +5,19 @@ import urllib.parse
 import http.server
 import os
 from src.engine.player import Player
-
+from src.strategy.strategy_manager import StrategyManager
 
 HOST_NAME = '0.0.0.0'
 PORT_NUMBER = ('PORT' in os.environ and int(os.environ['PORT'])) or 9000
+
+# Initialize StrategyManager once and inject its strategy into Player
+try:
+    _overrides = json.loads(os.getenv('STRATEGY_OVERRIDES', '{}'))
+except Exception:
+    _overrides = {}
+_MANAGER = StrategyManager(overrides=_overrides)
+_PLAYER = Player(strategy=_MANAGER.get_strategy())
+
 
 
 class PlayerService(http.server.BaseHTTPRequestHandler):
@@ -24,6 +33,7 @@ class PlayerService(http.server.BaseHTTPRequestHandler):
         else:
             postvars = {}
 
+
         # Validate action
         if 'action' not in postvars or not postvars['action']:
             self.send_response(400)
@@ -31,6 +41,7 @@ class PlayerService(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error":"missing action"}')
             return
+
 
         action = postvars['action'][0]
 
@@ -47,9 +58,9 @@ class PlayerService(http.server.BaseHTTPRequestHandler):
 
         response = b''
         if action == 'bet_request':
-            response = b'%d' % Player().betRequest(game_state)
+            response = b'%d' % _PLAYER.betRequest(game_state)
         elif action == 'showdown':
-            Player().showdown(game_state)
+            _PLAYER.showdown(game_state)
             response = b'{}'
         elif action == 'version':
             response = Player.VERSION.encode()
