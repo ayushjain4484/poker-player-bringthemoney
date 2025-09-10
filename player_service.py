@@ -68,6 +68,7 @@ if __name__ == '__main__':
                 from src.client.game_state_fetcher import GameStateFetcher
                 from src.services.state_collector import StateCollector
 
+
                 fetcher = GameStateFetcher(
                     base_url=os.environ['GAME_STATE_URL'],
                     storage_path=os.getenv('COLLECT_OUT', 'data/game_states.jsonl'),
