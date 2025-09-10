@@ -10,7 +10,7 @@ from src.strategy.ultra_pro_something import KillerInstinctStrategy
 
 
 class Player:
-    VERSION = "vAREwinninG - FINAL - ULTIMATE"  # keep a public version for the service
+    VERSION = "vAREwinninG"  # keep a public version for the service
 
     def __init__(self, strategy: Optional[Strategy] = None):
         # default to BasicStrategy if none supplied
