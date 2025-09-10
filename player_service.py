@@ -79,8 +79,6 @@ if __name__ == '__main__':
                     """
                     Resolve the current game id from the tournament's /game endpoint.
                     Supports both plain text and JSON responses.
-                    asdasdasdasd
-                    asdasdas
                     """
                     url = f"{base}/api/tournament/{tournament_id}/game"
                     req = Request(url, headers={"Accept": "application/json,*/*;q=0.8"})
