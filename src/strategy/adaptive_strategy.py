@@ -1,3 +1,27 @@
+"""
+leanpoker_adaptive_strategy.py
+
+Winner-takes-all, conservative & player-count–adaptive strategy for LeanPoker.
+
+What's inside:
+- Strategy base class
+- BasicStrategy (safe fallback)
+- AdaptiveStrategy (recommended): less aggressive, adapts to
+  * players still in the pot (multiway conservatism),
+  * players left in the match (table phase: 4-handed -> 3-handed -> HU),
+  * chip leader / covered status (role-aware),
+  * short-stack push/fold (chip-EV tuned),
+  * limp-isolation sizing,
+  * safe bet/raise construction (respects minimum_raise and stack).
+
+Usage:
+  from leanpoker_adaptive_strategy import AdaptiveStrategy
+  strategy = AdaptiveStrategy()
+  bet_amount = strategy.decide_bet(game_state)
+
+The code is dependency-free (only Python stdlib).
+"""
+
 import random
 from typing import List, Tuple, Dict, Any
 
@@ -32,20 +56,17 @@ def has_pair_with_board(hole: List[dict], board: List[dict]) -> bool:
     branks = {b[0] for b in bs}
     return len(hranks & branks) > 0
 
-
-# ---------- Adaptive, less-aggressive strategy ----------
+# ---------- Adaptive, less-aggressive strategy (Winner-Takes-All tuned) ----------
 class AdaptiveStrategy(Strategy):
     """
-    Conservative, player-count–adaptive LeanPoker strategy.
+    Conservative, player-count–adaptive LeanPoker strategy (winner-takes-all chip-EV).
 
-    Key ideas
-    - Adjusts *by number of players still in the pot* (n_alive):
-        HU (2): normal aggression, thinner value ok, more stabs.
-        3-way: tighter opens/defends, fewer 3-bet bluffs, fewer stabs.
-        4-way+: clearly conservative: multiway = value heavy, minimal bluffing.
-    - Smaller 3-bet bluff frequencies and wider folds when out of position.
-    - Postflop: multiway requires stronger value to bet/raise; draws prefer calling.
-    - Always clamps to legal sizes and our stack.
+    Adjusts by:
+    - n_in_pot: players still in the current hand (multiway -> value heavy, fewer bluffs).
+    - n_left: players still in the tournament/match (4-max -> 3-handed -> heads-up).
+    - Role: chip leader (and not covered) gets a small aggression bump; covered plays safer.
+    - Short stacks: chip-EV push/fold with slightly wider HU calls/jams.
+    - Limp isolation sizing: 3.5–4bb + 1bb per limper.
     """
 
     # ------------ Public API ------------
@@ -55,7 +76,7 @@ class AdaptiveStrategy(Strategy):
             if G["my_stack"] <= 0:
                 return 0
 
-            # ≤10bb: tighter push/fold than before (also scaled by table size)
+            # ≤10bb: tighter push/fold (scaled by table phase)
             if G["effective_bb"] <= 10 and G["street"] == 0:
                 return self._push_fold_preflop(G)
 
@@ -68,31 +89,43 @@ class AdaptiveStrategy(Strategy):
                 return 0
 
     def showdown(self, game_state: Dict[str, Any]) -> None:
+        # Optional place to log opponent tendencies; left as a no-op to keep file stateless.
         pass
 
     # ------------ Preflop ------------
     def _preflop_decision(self, G: Dict[str, Any]) -> int:
-        K = self._knobs(G)  # aggression & thresholds from n_alive
+        K = self._knobs(G)
         bucket = self._hand_bucket(G["hole"])
         pos = self._norm_pos(G["position"], G["n_seats"])
         to_call = G["to_call"]
-
+        ip = pos in ("CO", "BTN")
         facing_raise = to_call > G["bb"]
-        ip = pos in ("CO", "BTN")  # rough IP preflop
-        open_size_bb = 2.1 if ip else 2.4  # slightly smaller than aggressive versions
 
-        # Unopened (or limped) pot
+        # Limp isolation detection (rough): someone matched BB pre but no raise
+        limpers = 0
+        if G["street"] == 0 and G["current_buy_in"] == G["bb"]:
+            for idx, p in enumerate(G["players"]):
+                st = (p or {}).get("status", "active")
+                if st == "active" and int((p or {}).get("bet", 0) or 0) == G["bb"]:
+                    limpers += 1
+            # BB itself is in there; remove 1 if we're not BB
+            if pos != "BB" and limpers > 0:
+                limpers -= 1
+
+        # Open and iso sizes (a bit smaller and conservative)
+        open_size_bb = 2.1 if ip else 2.4
+        iso_size_bb  = (3.5 if ip else 4.0) + 1.0 * max(0, limpers)
+
         if not facing_raise:
             if self._should_open(pos, bucket, K):
-                desired_total = int(round(open_size_bb * G["bb"]))
+                desired_total = int(round((iso_size_bb if limpers > 0 else open_size_bb) * G["bb"]))
                 return self._raise_to_amount(G, desired_total)
 
-            # BB: defend only if hand is decent and price is small
             if G["position"] == "BB" and self._bb_should_defend(bucket, K):
                 return min(to_call, G["my_stack"])
             return 0
 
-        # Facing an open: value 3-bet; bluff 3-bet much rarer, esp. OOP
+        # Facing an open
         if self._should_value_3bet(pos, bucket, K):
             factor = 2.8 if ip else 3.6
             desired_total = int(round(factor * G["current_buy_in"]))
@@ -103,7 +136,6 @@ class AdaptiveStrategy(Strategy):
             desired_total = int(round(factor * G["current_buy_in"]))
             return self._raise_to_amount(G, desired_total)
 
-        # Conservative cold-calls (prefer IP & playable hands)
         if self._should_cold_call(pos, bucket, to_call, G, K):
             return min(to_call, G["my_stack"])
 
@@ -122,54 +154,49 @@ class AdaptiveStrategy(Strategy):
         mid_bb   = 2.5 + 0.6 * K["AF"]   # ~2.5–3.1bb
         big_bb   = 3.6 + 0.6 * K["AF"]   # ~3.6–4.2bb
 
-        # No bet to call
         if to_call == 0:
-            # Value: require stronger hands as players increase; size up only on wet/dynamic
+            # Value bets: require stronger hands as players increase
             if hs["two_pair_plus"] or hs["overpair"] or hs["top_pair_for_value"]:
                 want = big_bb if tex in ("wet", "dynamic") else mid_bb
                 return self._bet_bb(G, want)
 
-            # Strong draws: semi-bluff less when multiway; favor check IP multiway on dynamic boards
+            # Strong draws: semi-bluff less multiway; check more IP
             if hs["strong_draw"]:
-                if G["n_alive"] <= 2 or self._mix(G, K["draw_bet_freq"]):
+                if G["n_in_pot"] <= 2 or self._mix(G, K["draw_bet_freq"]):
                     want = mid_bb if tex != "dry" else small_bb
                     return self._bet_bb(G, want)
                 return 0
 
-            # Stabs: much rarer multiway; modest HU on dry boards
-            if tex == "dry" and G["n_alive"] <= 2 and self._mix(G, K["stab_freq_hu"]):
+            # Stabs: only HU and mostly on dry boards
+            if tex == "dry" and G["n_in_pot"] == 2 and self._mix(G, K["stab_freq_hu"]):
                 return self._bet_bb(G, small_bb)
             return 0
 
-        # Facing a bet: raise value, call more with price HU, fold more multiway
-        call_cap = max(G["bb"], int(G["my_stack"] * K["call_cap_frac"]))  # % of stack cap
+        # Facing a bet
+        call_cap = max(G["bb"], int(G["my_stack"] * K["call_cap_frac"]))
 
-        # Value: raise more selectively multiway; otherwise at least call affordable
         if hs["two_pair_plus"] or hs["overpair"] or (hs["top_pair_for_value"] and tex != "wet"):
             desired_total = G["current_buy_in"] + int(round((2.3 if tex == "dry" else 2.6) * G["bb"]))
             r = self._raise_to_amount(G, desired_total)
-            if r > to_call and r <= G["my_stack"] and (G["n_alive"] <= 3 or hs["two_pair_plus"] or hs["overpair"]):
+            if r > to_call and r <= G["my_stack"] and (G["n_in_pot"] <= 3 or hs["two_pair_plus"] or hs["overpair"]):
                 return r
             return min(to_call, G["my_stack"])
 
-        # Draws: raise as a semi-bluff only HU and with depth; otherwise prefer call if cheap
         if hs["strong_draw"]:
-            if (G["n_alive"] == 2 and G["effective_bb"] > 22 and self._mix(G, K["draw_raise_freq"])) or \
-               (tex == "dry" and self._mix(G, K["draw_raise_freq"] * 0.6)):
+            # Semi-bluff raises mostly HU and with depth
+            if (G["n_in_pot"] == 2 and G["effective_bb"] > 22 and self._mix(G, K["draw_raise_freq"])) or                    (tex == "dry" and self._mix(G, K["draw_raise_freq"] * 0.6)):
                 desired_total = G["current_buy_in"] + int(round(2.3 * G["bb"]))
                 r = self._raise_to_amount(G, desired_total)
                 if r > to_call and r <= G["my_stack"]:
                     return r
             return min(to_call, G["my_stack"]) if to_call <= max(call_cap, 2 * G["bb"]) else 0
 
-        # Middle/weak pair: pot-control; fold more often multiway or vs big sizing
         if hs["middle_pair"] or hs["weak_pair"]:
             thresh = max(G["bb"], int(G["my_stack"] * K["mpair_cap_frac"]))
-            return min(to_call, G["my_stack"]) if (to_call <= thresh and tex != "wet" and G["n_alive"] <= 3) else 0
+            return min(to_call, G["my_stack"]) if (to_call <= thresh and tex != "wet" and G["n_in_pot"] <= 3) else 0
 
-        # Air/backdoors: only peel very cheap HU on dry boards
         cheap = max(1, G["bb"] // 2)
-        return min(to_call, G["my_stack"]) if (tex == "dry" and to_call <= cheap and G["n_alive"] == 2) else 0
+        return min(to_call, G["my_stack"]) if (tex == "dry" and to_call <= cheap and G["n_in_pot"] == 2) else 0
 
     # ------------ Push/Fold (≤10bb preflop) ------------
     def _push_fold_preflop(self, G: Dict[str, Any]) -> int:
@@ -182,15 +209,14 @@ class AdaptiveStrategy(Strategy):
         small_pairs = (bucket == 4); suited_ace = (bucket == 5); broad_mid = (bucket == 3)
 
         jam_ok = False
-        # Slightly tighter with more players: 4-way remove weakest jams
-        if pos in ("EP", "UTG", "MP", "CO"):
-            jam_ok = premium or strong or small_pairs or (suited_ace and G["n_alive"] <= 3) or (broad_mid and G["n_alive"] == 2)
+        if pos in ("EP","UTG","MP","CO"):
+            jam_ok = premium or strong or small_pairs or (suited_ace and G["n_left"] <= 3) or (broad_mid and G["n_left"] == 2)
         elif pos == "BTN":
-            jam_ok = (bucket <= 6) or (bucket == 7 and G["n_alive"] == 2)
+            jam_ok = (bucket <= 6) or (bucket == 7 and G["n_left"] == 2)
         elif pos == "SB":
-            jam_ok = True if G["n_alive"] <= 3 else (premium or strong or small_pairs or suited_ace)
+            jam_ok = True if G["n_left"] <= 3 else (premium or strong or small_pairs or suited_ace)
         elif pos == "BB":
-            jam_ok = premium or strong or small_pairs or suited_ace or (broad_mid and G["n_alive"] <= 3)
+            jam_ok = premium or strong or small_pairs or suited_ace or (broad_mid and G["n_left"] <= 3)
 
         facing_raise = to_call > G["bb"]
         if facing_raise and not (premium or strong):
@@ -242,35 +268,49 @@ class AdaptiveStrategy(Strategy):
             return 7
         return 8
 
-    # ------------ Range knobs & decisions (use n_alive) ------------
+    # ------------ Range knobs & decisions (n_in_pot / n_left) ------------
     def _knobs(self, G: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Returns conservative parameters keyed off players currently active in the hand.
+        Chip-EV mode (winner-takes-all).
+        n_in_pot -> postflop aggression; n_left -> table phase.
         """
-        n = max(2, G["n_alive"])  # at least HU
-        # Aggression factor
-        AF = 1.0 if n == 2 else (0.8 if n == 3 else 0.65)
+        n_in = max(2, G["n_in_pot"])
+        n_left = max(2, G["n_left"])
+
+        # Postflop aggression factor scales with multiway
+        AF = 1.0 if n_in == 2 else (0.8 if n_in == 3 else 0.65)
+
+        # Table phase
+        hu = (n_left == 2)
+        three = (n_left == 3)
+        fourp = (n_left >= 4)
+
+        # Chip leader bump if not covered
+        leader_bump = 0.10 if (G["am_chipleader"] and not G["am_covered"]) else 0.0
 
         return dict(
             AF=AF,
-            # Preflop conservatism
-            p_open_loose = 0.20 if n >= 4 else (0.28 if n == 3 else 0.35),
-            p_3bet_bluff = 0.15 if n >= 4 else (0.25 if n == 3 else 0.35),
-            bb_defend_max_bucket = 6 if n >= 4 else (7 if n == 3 else 7),
-            cheap_div = 55 if n >= 4 else (50 if n == 3 else 45),
-            # Postflop frequencies/thresholds
-            top_pair_kicker = 12 if n >= 4 else (11 if n == 3 else 10),  # Q/J/T as min kicker
-            stab_freq_hu = 0.60,        # only used HU
-            draw_bet_freq = 0.35 if n >= 4 else (0.45 if n == 3 else 0.55),
-            draw_raise_freq = 0.18 if n >= 4 else (0.28 if n == 3 else 0.40),
-            call_cap_frac = 0.08 if n >= 4 else (0.10 if n == 3 else 0.125),
-            mpair_cap_frac = 0.05 if n >= 4 else (0.06 if n == 3 else 0.0625),
-            # Jam tightening when facing raise at short stacks
-            jam_face_raise_bb = 7 if n >= 4 else (8 if n == 3 else 9),
+            chip_ev=True,
+            # Preflop
+            p_open_loose = (0.42 if hu else 0.30 if three else 0.22) + leader_bump,
+            p_3bet_bluff = (0.40 if hu else 0.22 if three else 0.15) + leader_bump/2,
+            bb_defend_max_bucket = 7 if hu else (7 if three else 6),
+            cheap_div = 45 if hu else (50 if three else 55),
+
+            # Postflop
+            top_pair_kicker = 10 if hu else (11 if three else 12),
+            stab_freq_hu = 0.62,                     # HU only
+            draw_bet_freq = 0.55 if hu else (0.45 if three else 0.35),
+            draw_raise_freq = 0.40 if hu else (0.28 if three else 0.18),
+            call_cap_frac = 0.13 if hu else (0.10 if three else 0.08),
+            mpair_cap_frac = 0.0625 if hu else (0.06 if three else 0.05),
+
+            # Short-stack jam threshold when facing a raise
+            jam_face_raise_bb = 10 if hu else (8 if three else 7),
         )
 
     def _should_open(self, pos: str, bucket: int, K: Dict[str, Any]) -> bool:
-        # 4-max UTG ≈ CO ranges, but conservative knobs trim weakest opens
+        # UTG on short tables ≈ CO, but we stay conservative via knobs
         if pos in ("UTG", "EP"):
             return bucket in (1,2,3) or (bucket in (4,5) and self._mix_seed(K["p_open_loose"]))
         if pos in ("MP", "CO"):
@@ -278,7 +318,7 @@ class AdaptiveStrategy(Strategy):
         if pos == "BTN":
             return bucket <= 6 or (bucket == 7 and self._mix_seed(K["p_open_loose"]))
         if pos == "SB":
-            # SB opens trimmed: avoid most weak offsuit
+            # Trim weak offsuit in SB
             return bucket <= 6 or (bucket == 7 and self._mix_seed(K["p_open_loose"] * 0.6))
         return False
 
@@ -289,9 +329,9 @@ class AdaptiveStrategy(Strategy):
         return bucket == 1 or (bucket == 2 and pos in ("CO", "BTN"))
 
     def _should_bluff_3bet(self, pos: str, bucket: int, K: Dict[str, Any], eff_bb: int) -> bool:
-        if eff_bb <= 22:  # avoid punting shallow
+        if eff_bb <= 22:
             return False
-        if pos not in ("CO", "BTN", "SB"):  # OOP tighter
+        if pos not in ("CO", "BTN", "SB"):  # OOP: mostly avoid
             return False
         return (bucket in (5,6,3)) and self._mix_seed(K["p_3bet_bluff"])
 
@@ -303,7 +343,7 @@ class AdaptiveStrategy(Strategy):
         if pos == "BB":
             return bucket <= K["bb_defend_max_bucket"]
         if pos == "SB":
-            # prefer 3-bet/fold from SB; flat only decent pockets/suited Broadway when cheap
+            # prefer 3-bet/fold from SB; flat pockets when cheap
             return bucket in (2,4) and to_call <= 2 * G["bb"] and self._mix_seed(0.35)
         return False
 
@@ -319,7 +359,7 @@ class AdaptiveStrategy(Strategy):
 
         pair_with_board = has_pair_with_board(hole, board)
 
-        # Top pair considered for value only with decent kicker (tighter multiway via K["top_pair_kicker"])
+        # Top pair is value only with decent kicker, scaled by table phase
         top_pair_for_value = False
         if pair_with_board and b_ranks:
             my_high = max(r1[0], r2[0])
@@ -334,7 +374,7 @@ class AdaptiveStrategy(Strategy):
             if not pair and pair_with_board:
                 two_pair_plus = (r1[0] in b_ranks) and (r2[0] in b_ranks)
 
-        # Draws
+        # Draws (rough)
         suits = [s for _, s in bs]
         suit_count = {s: suits.count(s) for s in set(suits)}
         strong_fd = any(suit_count.get(s, 0) >= 2 for s in set([r1[1], r2[1]]))
@@ -396,22 +436,33 @@ class AdaptiveStrategy(Strategy):
         minimum_raise = int(S.get("minimum_raise", 0) or 0)
         my_bet = int(me.get("bet", 0) or 0)
         my_stack = int(me.get("stack", 0) or 0)
-        small_blind = int(S.get("small_blind", 0) or 0)
 
-        bb_guess = max(2 * small_blind, minimum_raise, 1)
+        # Safer blind detection
+        big_blind = int(S.get("big_blind", 0) or 0)
+        small_blind = int(S.get("small_blind", 0) or 0)
+        bb_guess = big_blind if big_blind > 0 else max(2 * small_blind, 1)
+
         to_call = max(0, current_buy_in - my_bet)
 
+        # Stacks
         opp_stacks = [int(p.get("stack", 0) or 0) for i, p in enumerate(players) if i != in_action]
         covered = max(opp_stacks) if opp_stacks else my_stack
         effective_stack = min(my_stack, covered)
         effective_bb = max(1, effective_stack // max(1, bb_guess))
 
-        # Players *still in the hand* right now
-        n_alive = sum(1 for p in players if (p or {}).get("status", "active") == "active")
-        n_seats = len(players)
+        # Counts: players still in the hand vs still in the match
+        status = lambda p: (p or {}).get("status", "active")
+        n_in_pot = sum(1 for p in players if status(p) == "active")
+        n_left   = sum(1 for p in players if status(p) != "out")
+        n_seats  = len(players)
 
+        # Position
         position = self._position(S, in_action)
         street = len(board)
+
+        # Chip leader flags
+        am_chipleader = my_stack >= max([my_stack] + opp_stacks)
+        am_covered = any(os > my_stack for os in opp_stacks)
 
         seed = S.get("round", None)
         if seed is None:
@@ -422,8 +473,10 @@ class AdaptiveStrategy(Strategy):
             players=players, me=me, hole=hole, board=board,
             current_buy_in=current_buy_in, minimum_raise=minimum_raise,
             my_bet=my_bet, my_stack=my_stack, to_call=to_call,
-            bb=bb_guess, effective_bb=effective_bb, n_alive=n_alive,
-            n_seats=n_seats, position=position, street=street,
+            bb=bb_guess, effective_bb=effective_bb,
+            n_in_pot=n_in_pot, n_left=n_left, n_seats=n_seats,
+            position=position, street=street,
+            am_chipleader=am_chipleader, am_covered=am_covered,
             dealer=S.get("dealer", 0) or 0
         )
 
@@ -439,7 +492,7 @@ class AdaptiveStrategy(Strategy):
         return "UTG" if n <= 6 else "MP"
 
     def _norm_pos(self, pos: str, n_seats: int) -> str:
-        # Map 4-max UTG ≈ CO for range decisions
+        # Map 4-max UTG ≈ CO for range decisions (kept conservative)
         if n_seats <= 4 and pos == "UTG":
             return "CO"
         return pos
@@ -451,3 +504,31 @@ class AdaptiveStrategy(Strategy):
     def _mix(self, G: Dict[str, Any], p: float) -> bool:
         random.seed(G.get("dealer", 0) * 1337 + G.get("current_buy_in", 0) * 7 + G.get("my_bet", 0))
         return random.random() < p
+
+
+__all__ = ["Strategy", "BasicStrategy", "AdaptiveStrategy"]
+
+
+if __name__ == "__main__":
+    # Tiny smoke test (does not cover all branches)
+    strategy = AdaptiveStrategy()
+    demo_state = {
+        "players": [
+            {"id": 0, "name": "p0", "status": "active", "stack": 1000, "bet": 0},
+            {"id": 1, "name": "p1", "status": "active", "stack": 900, "bet": 0},
+            {"id": 2, "name": "p2", "status": "active", "stack": 800, "bet": 0},
+            {"id": 3, "name": "me", "status": "active", "stack": 1100, "bet": 0, "hole_cards": [
+                {"rank": "A", "suit": "hearts"},
+                {"rank": "T", "suit": "hearts"},
+            ]},
+        ],
+        "in_action": 3,
+        "dealer": 1,
+        "small_blind": 5,
+        "big_blind": 10,
+        "current_buy_in": 10,
+        "minimum_raise": 10,
+        "community_cards": [],
+        "round": 1,
+    }
+    print("Demo bet:", strategy.decide_bet(demo_state))
