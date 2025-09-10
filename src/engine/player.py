@@ -3,6 +3,7 @@ from typing import Optional
 from src.strategy.adaptive_strategy import AdaptiveStrategy
 from src.strategy.advanced import AdvancedStrategy
 from src.strategy.base import Strategy
+from src.strategy.exploit_strategy import ExploitAdaptiveStrategy
 from src.strategy.killer_instinct_strategy import KillerInstinctStrategy
 
 
@@ -11,7 +12,7 @@ class Player:
 
     def __init__(self, strategy: Optional[Strategy] = None):
         # default to BasicStrategy if none supplied
-        self._strategy = strategy or AdaptiveStrategy()
+        self._strategy = strategy or ExploitAdaptiveStrategy()
 
     def bet_request(self, game_state: dict) -> int:
         return int(self._strategy.decide_bet(game_state))
