@@ -15,7 +15,7 @@ class Player:
     def __init__(self, strategy: Optional[Strategy] = None):
         # default to BasicStrategy if none supplied
 
-        self._strategy = strategy or KillerInstinctStrategy()
+        self._strategy = strategy or AdaptiveStrategy()
 
     def bet_request(self, game_state: dict) -> int:
         return int(self._strategy.decide_bet(game_state))
