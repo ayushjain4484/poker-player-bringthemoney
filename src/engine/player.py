@@ -4,8 +4,8 @@ from src.strategy.adaptive_strategy import AdaptiveStrategy
 from src.strategy.advanced import AdvancedStrategy
 from src.strategy.base import Strategy
 from src.strategy.exploit_strategy import ExploitAdaptiveStrategy
-
 from src.strategy.heads_up_strategy import HeadsUpFinisherStrategy
+from src.strategy.ultra_pro_something import KillerInstinctStrategy
 
 
 
@@ -15,7 +15,7 @@ class Player:
     def __init__(self, strategy: Optional[Strategy] = None):
         # default to BasicStrategy if none supplied
 
-        self._strategy = strategy or HeadsUpFinisherStrategy()
+        self._strategy = strategy or KillerInstinctStrategy()
 
     def bet_request(self, game_state: dict) -> int:
         return int(self._strategy.decide_bet(game_state))
