@@ -65,25 +65,79 @@ if __name__ == '__main__':
         # Optional background state collector controlled by env vars
         if os.getenv('COLLECT_STATES', '').lower() in ('1', 'true', 'yes'):
             try:
+                import ssl
+                from urllib.request import urlopen, Request
+                from urllib.error import URLError, HTTPError
                 from src.client.game_state_fetcher import GameStateFetcher
                 from src.services.state_collector import StateCollector
 
-                # Prefer explicit GAME_STATE_URL; otherwise build from GAME_ID using the provided tournament URL
+                disable_verify = os.getenv('DISABLE_SSL_VERIFY', '').lower() in ('1', 'true', 'yes')
+                ssl_context = None if not disable_verify else ssl._create_unverified_context()
+
+
+                def _resolve_game_id(tournament_id: str, base: str) -> str:
+                    """
+                    Resolve the current game id from the tournament's /game endpoint.
+                    Supports both plain text and JSON responses.
+                    """
+                    url = f"{base}/api/tournament/{tournament_id}/game"
+                    req = Request(url, headers={"Accept": "application/json,*/*;q=0.8"})
+                    with urlopen(req, timeout=5.0, context=ssl_context) as resp:
+                        payload = resp.read().decode("utf-8").strip()
+                        # Try to parse JSON first
+                        try:
+                            data = json.loads(payload)
+                            # Accept common shapes
+                            if isinstance(data, str):
+                                return data
+                            if isinstance(data, dict):
+                                for k in ("game_id", "id", "gameId"):
+                                    if k in data and isinstance(data[k], str):
+                                        return data[k]
+                            # Fallback if array
+                            if isinstance(data, list) and data:
+                                # take last or first string-ish entry
+                                for item in reversed(data):
+                                    if isinstance(item, str):
+                                        return item
+                                    if isinstance(item, dict):
+                                        for k in ("game_id", "id", "gameId"):
+                                            if k in item and isinstance(item[k], str):
+                                                return item[k]
+                        except Exception:
+                            # Not JSON, maybe plain id in body
+                            pass
+                        # If not JSON, use raw payload if it looks like an id
+                        if payload and len(payload) >= 8 and all(ch.isalnum() for ch in payload):
+                            return payload
+                        raise RuntimeError(f"Unable to resolve game id from response: {payload[:120]}")
+
+
+                # Prefer explicit GAME_STATE_URL; otherwise construct from tournament and game
                 base_url = os.getenv('GAME_STATE_URL')
                 if not base_url:
+                    base_host = os.getenv('LEANPOKER_BASE', 'https://live.leanpoker.org').rstrip('/')
+                    tournament_id = os.getenv('TOURNAMENT_ID') or '68bf3f775bca7800025c408e'
                     game_id = os.getenv('GAME_ID')
+
                     if not game_id:
-                        raise RuntimeError("COLLECT_STATES is enabled but neither GAME_STATE_URL nor GAME_ID is set.")
-                    base_url = f"https://live.leanpoker.org/api/tournament/68bf3f775bca7800025c408e/game/{game_id}/log"
+                        try:
+                            game_id = _resolve_game_id(tournament_id, base_host)
+                            print((time.asctime(), f"Resolved game_id={game_id} for tournament_id={tournament_id}"))
+                        except (URLError, HTTPError, RuntimeError) as e:
+                            raise RuntimeError(f"COLLECT_STATES enabled but could not resolve GAME_ID: {e}")
+
+                    base_url = f"{base_host}/api/tournament/{tournament_id}/game/{game_id}/log"
 
                 fetcher = GameStateFetcher(
                     base_url=base_url,
                     storage_path=os.getenv('COLLECT_OUT', 'data/game_states.jsonl'),
+                    verify_ssl=not disable_verify,
                 )
                 interval = float(os.getenv('COLLECT_INTERVAL', '2.0'))
                 collector = StateCollector(fetcher=fetcher, interval_sec=interval)
                 collector.start()
-                print((time.asctime(), f"StateCollector started - url={base_url} interval={interval}s"))
+                print((time.asctime(), f"StateCollector started - url={base_url} interval={interval}s (verify_ssl={not disable_verify})"))
             except Exception as e:
                 print((time.asctime(), f"StateCollector failed to start: {e}"))
 
