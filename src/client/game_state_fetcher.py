@@ -11,9 +11,9 @@ from urllib.request import Request, urlopen
 @dataclass
 class GameStateFetcher:
     base_url: str
-    storage_path: Path | str = "data/game_states.jsonl"
+    storage_path: str | Path = "data/game_states.jsonl"
     timeout: float = 5.0
-    etag: Optional[str] = None  # simple conditional GET support
+    etag: Optional[str] = None
 
     def fetch_state(
         self,
@@ -21,7 +21,6 @@ class GameStateFetcher:
         headers: Optional[Dict[str, str]] = None,
         persist: bool = True,
     ) -> Dict[str, Any]:
-        # Build URL with very simple query encoding
         url = self.base_url
         if params:
             def enc(v: Any) -> str:
@@ -43,13 +42,8 @@ class GameStateFetcher:
         if persist:
             path = Path(self.storage_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            record = {
-                "timestamp": time.time(),
-                "source_url": url,
-                "etag": self.etag,
-                "state": data,
-            }
+            rec = {"timestamp": time.time(), "source_url": url, "etag": self.etag, "state": data}
             with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
 
         return data
