@@ -4,8 +4,8 @@ import json
 import urllib.parse
 import http.server
 import os
-
 from src.engine.player import Player
+
 
 HOST_NAME = '0.0.0.0'
 PORT_NUMBER = ('PORT' in os.environ and int(os.environ['PORT'])) or 9000
@@ -63,20 +63,27 @@ if __name__ == '__main__':
     collector = None
     try:
         # Optional background state collector controlled by env vars
-        if os.getenv('COLLECT_STATES', '').lower() in ('1', 'true', 'yes') and os.getenv('GAME_STATE_URL'):
+        if os.getenv('COLLECT_STATES', '').lower() in ('1', 'true', 'yes'):
             try:
                 from src.client.game_state_fetcher import GameStateFetcher
                 from src.services.state_collector import StateCollector
 
+                # Prefer explicit GAME_STATE_URL; otherwise build from GAME_ID using the provided tournament URL
+                base_url = os.getenv('GAME_STATE_URL')
+                if not base_url:
+                    game_id = os.getenv('GAME_ID')
+                    if not game_id:
+                        raise RuntimeError("COLLECT_STATES is enabled but neither GAME_STATE_URL nor GAME_ID is set.")
+                    base_url = f"https://live.leanpoker.org/api/tournament/68bf3f775bca7800025c408e/game/{game_id}/log"
 
                 fetcher = GameStateFetcher(
-                    base_url=os.environ['GAME_STATE_URL'],
+                    base_url=base_url,
                     storage_path=os.getenv('COLLECT_OUT', 'data/game_states.jsonl'),
                 )
                 interval = float(os.getenv('COLLECT_INTERVAL', '2.0'))
                 collector = StateCollector(fetcher=fetcher, interval_sec=interval)
                 collector.start()
-                print((time.asctime(), f"StateCollector started - url={os.environ['GAME_STATE_URL']} interval={interval}s"))
+                print((time.asctime(), f"StateCollector started - url={base_url} interval={interval}s"))
             except Exception as e:
                 print((time.asctime(), f"StateCollector failed to start: {e}"))
 
